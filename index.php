@@ -2,7 +2,7 @@
 // --- 1. 环境与错误处理 ---
 error_reporting(E_ALL);
 ini_set('display_errors', 1); // 开启报错，方便调试
-set_time_limit(120); 
+set_time_limit(120);
 
 // --- 2. 配置信息 (已填入新 Key) ---
 $apiKey = '13xSqpsRYAH9oeZG5N5XsRwcSwyegTHtni3Axisx0b2RMgWnpZNPJQQJ99CBACi0881XJ3w3AAALACOGRyKN';
@@ -25,7 +25,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
 
             // A. 调用 Azure AI (自动修正路径拼接)
             $cleanEndpoint = rtrim(trim($endpoint), '/');
-            $analyzeUrl = $cleanEndpoint . "/documentintelligence/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
+            // 修改为 formrecognizer 路径，这是目前最兼容的版本
+            $analyzeUrl = $cleanEndpoint . "/formrecognizer/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
 
             $ch = curl_init($analyzeUrl);
             curl_setopt($ch, CURLOPT_POST, true);
@@ -36,7 +37,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
             curl_setopt($ch, CURLOPT_POSTFIELDS, $imgData);
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
             curl_setopt($ch, CURLOPT_HEADER, true); // 必须获取头信息来拿 Operation-Location
-            
+
             $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
@@ -64,7 +65,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
                 curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
                 $jsonResponse = curl_exec($ch2);
                 $statusData = json_decode($jsonResponse, true);
-                
+
                 if (isset($statusData['status']) && $statusData['status'] == 'succeeded') {
                     $isDone = true;
                 } elseif (isset($statusData['status']) && $statusData['status'] == 'failed') {
@@ -97,12 +98,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
 
         // E. 生成 CSV
         $fp = fopen($csvFile, 'w');
-        fprintf($fp, chr(0xEF).chr(0xBB).chr(0xBF)); // 防止 Excel 乱码
+        fprintf($fp, chr(0xEF) . chr(0xBB) . chr(0xBF)); // 防止 Excel 乱码
         foreach ($displayResults as $row) {
             fputcsv($fp, [$row['name'], $row['price']]);
         }
         fclose($fp);
-
     } catch (Exception $e) {
         $errorMsg = $e->getMessage();
     }
@@ -111,19 +111,59 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
 
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <title>全家收据 OCR 最终版</title>
     <style>
-        body { font-family: "Microsoft YaHei", sans-serif; margin: 40px; line-height: 1.6; }
-        .container { max-width: 800px; margin: auto; }
-        .table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        .table th, .table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        .error { background: #fff0f0; color: #d00; padding: 15px; border: 1px solid #d00; border-radius: 4px; }
-        .btn { background: #0078d4; color: white; padding: 10px 20px; border: none; cursor: pointer; border-radius: 4px; }
-        .total { font-weight: bold; background: #f9f9f9; }
+        body {
+            font-family: "Microsoft YaHei", sans-serif;
+            margin: 40px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: auto;
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        .table th,
+        .table td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+
+        .error {
+            background: #fff0f0;
+            color: #d00;
+            padding: 15px;
+            border: 1px solid #d00;
+            border-radius: 4px;
+        }
+
+        .btn {
+            background: #0078d4;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+
+        .total {
+            font-weight: bold;
+            background: #f9f9f9;
+        }
     </style>
 </head>
+
 <body>
     <div class="container">
         <h1>全家收据识别系统</h1>
@@ -145,7 +185,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
         <?php if (!empty($displayResults)): ?>
             <h2>识别结果</h2>
             <table class="table">
-                <thead><tr><th>商品名称</th><th>金额 (円)</th></tr></thead>
+                <thead>
+                    <tr>
+                        <th>商品名称</th>
+                        <th>金额 (円)</th>
+                    </tr>
+                </thead>
                 <tbody>
                     <?php foreach ($displayResults as $res): ?>
                         <tr class="<?= $res['name'] == '合计' ? 'total' : '' ?>">
@@ -156,10 +201,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
                 </tbody>
             </table>
             <p>
-                ✅ <a href="result.csv">下载结果 CSV</a> | 
+                ✅ <a href="result.csv">下载结果 CSV</a> |
                 ✅ <a href="ocr.log" target="_blank">查看 ocr.log</a>
             </p>
         <?php endif; ?>
     </div>
 </body>
+
 </html>
