@@ -1,211 +1,178 @@
 <?php
-// --- 1. 环境与错误处理 ---
-error_reporting(E_ALL);
-ini_set('display_errors', 1); // 开启报错，方便调试
-set_time_limit(120);
+// --- 1. 環境設定とエラー処理 ---
+error_reporting(E_ALL & ~E_NOTICE);
+ini_set('display_errors', 1);
+set_time_limit(120); 
 
-// --- 2. 配置信息 (已填入新 Key) ---
+// --- 2. 設定情報 ---
 $apiKey = '13xSqpsRYAH9oeZG5N5XsRwcSwyegTHtni3Axisx0b2RMgWnpZNPJQQJ99CBACi0881XJ3w3AAALACOGRyKN';
 $endpoint = 'https://receipt-ai-vision-01.cognitiveservices.azure.com/';
 $ocrLogFile = 'ocr.log';
 $csvFile = 'result.csv';
 
+// データベース設定
+$dbServer = "receipt-sql-server-24jn0245.database.windows.net";
+$dbName = "receipt-db";
+$dbUser = "jnsql";
+$dbPass = 'Pa$$word1234';
+
 $displayResults = [];
 $errorMsg = "";
 
-// --- 3. 核心处理逻辑 ---
+// --- 3. コアロジック ---
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
     try {
-        // 【注意】如果需要数据库，请在后面自行开启。为了先拿 ocr.log，我们先跑通 AI 流程。
+        // A. データベース接続とテーブル作成
+        $conn = new PDO("sqlsrv:server=$dbServer;Database=$dbName", $dbUser, $dbPass);
+        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        
+        // テーブルが存在しない場合は作成
+        $conn->exec("IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='receipts' AND xtype='U')
+                    CREATE TABLE receipts (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        item_name NVARCHAR(255),
+                        price INT,
+                        is_total INT,
+                        created_at DATETIME DEFAULT GETDATE()
+                    )");
 
         foreach ($_FILES['files']['tmp_name'] as $tmpName) {
             if (empty($tmpName)) continue;
 
             $imgData = file_get_contents($tmpName);
-
-            // A. 调用 Azure AI (自动修正路径拼接)
             $cleanEndpoint = rtrim(trim($endpoint), '/');
-            // 修改为 formrecognizer 路径，这是目前最兼容的版本
+            // 成功したパスを使用
             $analyzeUrl = $cleanEndpoint . "/formrecognizer/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
 
             $ch = curl_init($analyzeUrl);
             curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                'Content-Type: application/octet-stream',
-                'Ocp-Apim-Subscription-Key: ' . trim($apiKey)
-            ]);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/octet-stream', 'Ocp-Apim-Subscription-Key: ' . trim($apiKey)]);
             curl_setopt($ch, CURLOPT_POSTFIELDS, $imgData);
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HEADER, true); // 必须获取头信息来拿 Operation-Location
-
+            curl_setopt($ch, CURLOPT_HEADER, true);
             $response = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
-            if ($httpCode !== 202) {
-                $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
-                $body = substr($response, $headerSize);
-                throw new Exception("Azure 拒绝了请求。状态码: $httpCode。原因: " . $body);
-            }
+            if ($httpCode !== 202) throw new Exception("Azure AI 接続エラー。ステータスコード: $httpCode");
 
-            // 提取结果查询地址
             preg_match('/Operation-Location: (.*)/i', $response, $matchesURL);
             $resultUrl = isset($matchesURL[1]) ? trim($matchesURL[1]) : null;
             curl_close($ch);
 
-            if (!$resultUrl) throw new Exception("未能在响应头中找到 Operation-Location");
-
-            // B. 轮询识别结果
-            $isDone = false;
-            $statusData = [];
-            $retryCount = 0;
-            while (!$isDone && $retryCount < 30) {
+            // B. 解析結果の取得（ポーリング）
+            $isDone = false; $statusData = []; $retry = 0;
+            while (!$isDone && $retry < 30) {
                 sleep(2);
                 $ch2 = curl_init($resultUrl);
                 curl_setopt($ch2, CURLOPT_HTTPHEADER, ['Ocp-Apim-Subscription-Key: ' . trim($apiKey)]);
                 curl_setopt($ch2, CURLOPT_RETURNTRANSFER, true);
                 $jsonResponse = curl_exec($ch2);
                 $statusData = json_decode($jsonResponse, true);
-
-                if (isset($statusData['status']) && $statusData['status'] == 'succeeded') {
-                    $isDone = true;
-                } elseif (isset($statusData['status']) && $statusData['status'] == 'failed') {
-                    throw new Exception("AI 解析图片失败。");
-                }
+                if (isset($statusData['status']) && $statusData['status'] == 'succeeded') $isDone = true;
                 curl_close($ch2);
-                $retryCount++;
+                $retry++;
             }
 
-            // C. 写入 ocr.log (课题核心要求)
+            // ログの書き込み
             file_put_contents($ocrLogFile, "--- SCAN [" . date('Y-m-d H:i:s') . "] ---\n" . $jsonResponse . "\n\n", FILE_APPEND);
 
-            // D. 数据清洗与展示
+            // C. データの解析とDB保存
             $doc = $statusData['analyzeResult']['documents'][0]['fields'] ?? [];
             $items = $doc['Items']['valueArray'] ?? [];
             $totalAmount = $doc['Total']['valueNumber'] ?? 0;
 
+            $stmt = $conn->prepare("INSERT INTO receipts (item_name, price, is_total) VALUES (:name, :price, :is_total)");
+
             foreach ($items as $item) {
-                $rawName = $item['valueObject']['Description']['valueString'] ?? '不明商品';
-                // 课题要求：去除“轻”、◎、空格、*
+                $rawName = $item['valueObject']['Description']['valueString'] ?? '不明な商品';
+                // 不要な文字を削除（軽、◎、空白、*）
                 $cleanName = str_replace(['轻', '◎', ' ', '　', '*'], '', $rawName);
                 $price = (int)($item['valueObject']['TotalPrice']['valueNumber'] ?? 0);
 
                 if ($price > 0) {
+                    $stmt->execute(['name' => $cleanName, 'price' => $price, 'is_total' => 0]);
                     $displayResults[] = ['name' => $cleanName, 'price' => $price];
                 }
             }
-            $displayResults[] = ['name' => '合计', 'price' => (int)$totalAmount];
+            // 合計行の追加
+            $stmt->execute(['name' => '合計', 'price' => (int)$totalAmount, 'is_total' => 1]);
+            $displayResults[] = ['name' => '合計', 'price' => (int)$totalAmount];
         }
 
-        // E. 生成 CSV
+        // D. CSVの生成
         $fp = fopen($csvFile, 'w');
-        fprintf($fp, chr(0xEF) . chr(0xBB) . chr(0xBF)); // 防止 Excel 乱码
-        foreach ($displayResults as $row) {
-            fputcsv($fp, [$row['name'], $row['price']]);
-        }
+        fprintf($fp, chr(0xEF).chr(0xBB).chr(0xBF)); 
+        foreach ($displayResults as $row) { fputcsv($fp, [$row['name'], $row['price']]); }
         fclose($fp);
+
     } catch (Exception $e) {
-        $errorMsg = $e->getMessage();
+        $errorMsg = "エラーが発生しました: " . $e->getMessage();
     }
 }
 ?>
 
 <!DOCTYPE html>
-<html lang="zh-CN">
-
+<html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <title>全家收据 OCR 最终版</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>レシートOCRシステム - Azure AI & SQL</title>
     <style>
-        body {
-            font-family: "Microsoft YaHei", sans-serif;
-            margin: 40px;
-            line-height: 1.6;
-        }
-
-        .container {
-            max-width: 800px;
-            margin: auto;
-        }
-
-        .table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-
-        .table th,
-        .table td {
-            border: 1px solid #ddd;
-            padding: 12px;
-            text-align: left;
-        }
-
-        .error {
-            background: #fff0f0;
-            color: #d00;
-            padding: 15px;
-            border: 1px solid #d00;
-            border-radius: 4px;
-        }
-
-        .btn {
-            background: #0078d4;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            cursor: pointer;
-            border-radius: 4px;
-        }
-
-        .total {
-            font-weight: bold;
-            background: #f9f9f9;
-        }
+        body { font-family: "Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif; margin: 40px; background-color: #f4f7f9; color: #333; }
+        .container { max-width: 900px; margin: auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #0078d4; border-bottom: 2px solid #0078d4; padding-bottom: 10px; }
+        .table { width: 100%; border-collapse: collapse; margin-top: 25px; }
+        .table th, .table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        .table th { background-color: #f8f9fa; }
+        .total-row { font-weight: bold; background-color: #e7f3ff; }
+        .error { color: #a4373a; background: #fde7e9; padding: 15px; border: 1px solid #a4373a; border-radius: 4px; margin-bottom: 20px; }
+        .upload-section { background: #f0f4f8; padding: 20px; border-radius: 4px; margin-bottom: 30px; }
+        .btn { background-color: #0078d4; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        .btn:hover { background-color: #005a9e; }
+        .links { margin-top: 20px; display: flex; gap: 20px; }
+        .links a { color: #0078d4; text-decoration: none; font-weight: bold; }
+        .links a:hover { text-decoration: underline; }
     </style>
 </head>
-
 <body>
     <div class="container">
-        <h1>全家收据识别系统</h1>
+        <h1>レシート自動解析システム</h1>
+        <p>Azure AI Vision を使用してファミリーマートのレシートを解析し、データベースへ保存します。</p>
 
         <?php if ($errorMsg): ?>
-            <div class="error">
-                <strong>识别失败：</strong><br>
-                <?= htmlspecialchars($errorMsg) ?>
-            </div>
+            <div class="error"><?= htmlspecialchars($errorMsg) ?></div>
         <?php endif; ?>
 
-        <form method="post" enctype="multipart/form-data">
-            <p>请选择收据照片（支持多选）：</p>
-            <input type="file" name="files[]" multiple accept="image/*">
-            <br><br>
-            <button type="submit" class="btn">开始上传并识别</button>
-        </form>
+        <div class="upload-section">
+            <form method="post" enctype="multipart/form-data">
+                <label>レシート画像を選択（複数可）:</label><br><br>
+                <input type="file" name="files[]" multiple accept="image/*">
+                <br><br>
+                <button type="submit" class="btn">アップロードして解析を実行</button>
+            </form>
+        </div>
 
         <?php if (!empty($displayResults)): ?>
-            <h2>识别结果</h2>
+            <h2>解析結果</h2>
             <table class="table">
                 <thead>
-                    <tr>
-                        <th>商品名称</th>
-                        <th>金额 (円)</th>
-                    </tr>
+                    <tr><th>商品名</th><th>金額 (円)</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach ($displayResults as $res): ?>
-                        <tr class="<?= $res['name'] == '合计' ? 'total' : '' ?>">
+                        <tr class="<?= $res['name'] == '合計' ? 'total-row' : '' ?>">
                             <td><?= htmlspecialchars($res['name']) ?></td>
                             <td><?= number_format($res['price']) ?></td>
                         </tr>
                     <?php endforeach; ?>
                 </tbody>
             </table>
-            <p>
-                ✅ <a href="result.csv">下载结果 CSV</a> |
-                ✅ <a href="ocr.log" target="_blank">查看 ocr.log</a>
-            </p>
+            
+            <div class="links">
+                <a href="result.csv">📊 CSVファイルをダウンロード</a>
+                <a href="ocr.log" target="_blank">📄 ocr.logを表示</a>
+            </div>
         <?php endif; ?>
     </div>
 </body>
-
 </html>
