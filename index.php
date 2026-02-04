@@ -1,24 +1,25 @@
 <?php
-// --- 1. 环境优化配置 ---
-error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING); // 隐藏警告，防止阻塞
+// --- 1. 環境設定 ---
+error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING); 
 ini_set('display_errors', 0);
-set_time_limit(120); // 增加运行时间到120秒，适应免费版速度
+set_time_limit(120); // 処理時間を120秒に延長
 
-// --- 2. 配置信息 ---
+// --- 2. 設定情報 ---
 $apiKey = 'AlQFjz0JcRNSLRw20hWIA0NOCuiAGAuSP4HruBOb8cHtIPoLA0wXJQQJ99CBACi0881XJ3w3AAALACOGaV2b';
 $endpoint = 'https://receipt-ai-vision-01.cognitiveservices.azure.com/';
 $ocrLogFile = 'ocr.log';
 $csvFile = 'result.csv';
 
-// 数据库配置
+// データベース設定
 $dbServer = "receipt-sql-server-24jn0245.database.windows.net";
 $dbName = "receipt-db";
 $dbUser = "jnsql";
 $dbPass = 'Pa$$word1234';
 
 $displayResults = [];
+$errorMsg = "";
 
-// --- 3. 核心逻辑 ---
+// --- 3. メインロジック ---
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
     try {
         $conn = new PDO("sqlsrv:server=$dbServer;Database=$dbName", $dbUser, $dbPass);
@@ -27,7 +28,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
         foreach ($_FILES['files']['tmp_name'] as $tmpName) {
             if (empty($tmpName)) continue;
 
-            // A. 调用 Azure AI
+            // A. Azure AI呼び出し
             $analyzeUrl = $endpoint . "documentintelligence/documentModels/prebuilt-receipt:analyze?api-version=2023-07-31";
             $imgData = file_get_contents($tmpName);
 
@@ -48,7 +49,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
 
             if (!$resultUrl) continue;
 
-            // B. 轮询结果
+            // B. 結果のポーリング（最大30回試行）
             $isDone = false;
             $statusData = [];
             $retryCount = 0;
@@ -64,10 +65,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
                 $retryCount++;
             }
 
-            // C. 记录日志
+            // C. ログ記録
             file_put_contents($ocrLogFile, "--- SCAN [" . date('Y-m-d H:i:s') . "] ---\n" . $jsonResponse . "\n\n", FILE_APPEND);
 
-            // D. 解析并存入数据库
+            // D. 解析とDB保存
             $doc = $statusData['analyzeResult']['documents'][0]['fields'] ?? [];
             $items = $doc['Items']['valueArray'] ?? [];
             $totalAmount = $doc['Total']['valueNumber'] ?? 0;
@@ -75,7 +76,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
             $stmt = $conn->prepare("INSERT INTO receipts (item_name, price, is_total) VALUES (:name, :price, :is_total)");
 
             foreach ($items as $item) {
-                $rawName = $item['valueObject']['Description']['valueString'] ?? '不明商品';
+                $rawName = $item['valueObject']['Description']['valueString'] ?? '不明な商品';
+                // ファミマのレシート特有の記号を掃除
                 $cleanName = str_replace(['轻', '◎', ' ', '　', '*'], '', $rawName);
                 $price = (int)($item['valueObject']['TotalPrice']['valueNumber'] ?? 0);
 
@@ -85,12 +87,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
                 }
             }
             
-            // 合计行
-            $stmt->execute(['name' => '合计', 'price' => (int)$totalAmount, 'is_total' => 1]);
-            $displayResults[] = ['name' => '合计', 'price' => (int)$totalAmount];
+            // 合計
+            $stmt->execute(['name' => '合計', 'price' => (int)$totalAmount, 'is_total' => 1]);
+            $displayResults[] = ['name' => '合計', 'price' => (int)$totalAmount];
         }
 
-        // E. 生成 CSV
+        // E. CSV生成
         $fp = fopen($csvFile, 'w');
         fprintf($fp, chr(0xEF).chr(0xBB).chr(0xBF)); 
         foreach ($displayResults as $row) {
@@ -99,7 +101,55 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_FILES['files'])) {
         fclose($fp);
 
     } catch (Exception $e) {
-        $errorMsg = "系统繁忙或数据库连接超时，请稍后再试。";
+        $errorMsg = "エラーが発生しました: " . $e->getMessage();
     }
 }
 ?>
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>レシートOCRシステム</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; line-height: 1.6; }
+        .result-table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        .result-table th, .result-table td { border: 1px solid #ccc; padding: 10px; text-align: left; }
+        .total-row { background-color: #f9f9f9; font-weight: bold; }
+        .btn { padding: 10px 20px; background: #0078d4; color: white; border: none; cursor: pointer; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <h1>レシート自動解析システム (Azure AI)</h1>
+    
+    <form action="" method="post" enctype="multipart/form-data">
+        <p>レシート画像を選択してください（複数可）：</p>
+        <input type="file" name="files[]" multiple accept="image/*">
+        <br><br>
+        <button type="submit" class="btn">アップロードして解析開始</button>
+    </form>
+
+    <?php if ($errorMsg): ?>
+        <p class="error"><?= htmlspecialchars($errorMsg) ?></p>
+    <?php endif; ?>
+
+    <?php if (!empty($displayResults)): ?>
+        <h2>解析結果：</h2>
+        <table class="result-table">
+            <thead>
+                <tr><th>商品名</th><th>金額 (円)</th></tr>
+            </thead>
+            <tbody>
+                <?php foreach ($displayResults as $item): ?>
+                    <tr class="<?= $item['name'] == '合計' ? 'total-row' : '' ?>">
+                        <td><?= htmlspecialchars($item['name']) ?></td>
+                        <td><?= number_format($item['price']) ?></td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <p><a href="result.csv">CSVファイルをダウンロード</a></p>
+    <?php endif; ?>
+</body>
+</html>
